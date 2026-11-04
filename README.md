@@ -5,11 +5,12 @@ The point is not just a working shortener, it's the design decisions, trade-offs
 and measurements recorded along the way, so you can talk about them in an interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 1 is done (Nov 3, 2026). The project is finished when every item below is
+Day 2 is done (Nov 4, 2026). The project is finished when every item below is
 checked off, which should be around Nov 19, 2026 if no day is missed.
 
 ## What it does so far
 - `POST /api/shorten`, takes a long URL, returns a short code
+- `POST /api/shorten` with `custom_alias`, takes a user-chosen code instead
 - `GET /{code}`, redirects to the original URL and records a click
 - `GET /api/stats/{code}`, total clicks for a code
 
@@ -29,7 +30,7 @@ pytest
 
 ## Daily build plan (one feature + tests per day)
 - [x] Day 1, Core API: shorten, redirect, click stats (Nov 3)
-- [ ] Day 2, Custom aliases (user-chosen code, conflict returns 409)
+- [x] Day 2, Custom aliases (user-chosen code, conflict returns 409) (Nov 4)
 - [ ] Day 3, Link expiry (expired links return 410)
 - [ ] Day 4, Duplicate URLs return the existing code
 - [ ] Day 5, In-memory LRU cache in front of the database for redirects
@@ -55,3 +56,7 @@ pytest
   stays the source of truth.
 - Unknown short codes return 404, including codes that decode to out-of-range
   ids (fixed after a test caught an OverflowError on Day 1).
+- Custom aliases: stored in a unique column, looked up before generated
+  codes, limited to letters, digits, hyphen and underscore, 1 to 64 chars.
+  A taken alias, or an alias that would shadow an existing generated code,
+  returns 409. Invalid characters return 422 from request validation.

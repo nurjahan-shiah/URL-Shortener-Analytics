@@ -1,12 +1,15 @@
 """Day 1: URL shortener core, shorten, redirect, stats.
 Day 2: custom aliases, user-chosen code, conflict returns 409.
+Day 3: link expiry, expired links return 410.
 
 Storage is SQLite, created next to this module as urls.db on first run.
 Short codes are base62 of the row id: simple and collision-free.
 Custom aliases are stored in their own column and take precedence in lookup.
+Expiry is an optional UTC timestamp per link, set at shorten time.
 """
 import re
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -26,12 +29,14 @@ def _db():
         "CREATE TABLE IF NOT EXISTS urls ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "long_url TEXT NOT NULL, clicks INTEGER NOT NULL DEFAULT 0, "
-        "custom_alias TEXT UNIQUE)"
+        "custom_alias TEXT UNIQUE, expires_at TEXT)"
     )
     columns = [row[1] for row in conn.execute("PRAGMA table_info(urls)")]
     if "custom_alias" not in columns:
         conn.execute("ALTER TABLE urls ADD COLUMN custom_alias TEXT UNIQUE")
-        conn.commit()
+    if "expires_at" not in columns:
+        conn.execute("ALTER TABLE urls ADD COLUMN expires_at TEXT")
+    conn.commit()
     return conn
 
 
@@ -65,19 +70,23 @@ def _lookup_id(code: str) -> int:
 
 
 def _resolve(conn, code: str):
-    """Return (id, long_url, clicks) for an alias or a generated code."""
+    """Return (id, long_url, clicks, expires_at) for an alias or a generated code."""
     row = conn.execute(
-        "SELECT id, long_url, clicks FROM urls WHERE custom_alias = ?",
+        "SELECT id, long_url, clicks, expires_at FROM urls WHERE custom_alias = ?",
         (code,),
     ).fetchone()
-    if row is not None:
-        return row
-    row_id = _lookup_id(code)
-    row = conn.execute(
-        "SELECT id, long_url, clicks FROM urls WHERE id = ?", (row_id,)
-    ).fetchone()
+    if row is None:
+        row_id = _lookup_id(code)
+        row = conn.execute(
+            "SELECT id, long_url, clicks, expires_at FROM urls WHERE id = ?",
+            (row_id,),
+        ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Unknown short code")
+    if row[3] is not None:
+        expires_at = datetime.fromisoformat(row[3])
+        if expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=410, detail="Link expired")
     return row
 
 
@@ -86,11 +95,18 @@ class ShortenRequest(BaseModel):
     custom_alias: str | None = Field(
         default=None, pattern=r"^[A-Za-z0-9_-]{1,64}$"
     )
+    expires_in_seconds: int | None = Field(default=None, gt=0)
 
 
 @app.post("/api/shorten")
 def shorten(req: ShortenRequest):
     conn = _db()
+    expires_at = None
+    if req.expires_in_seconds is not None:
+        expires_at = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=req.expires_in_seconds)
+        ).isoformat()
     if req.custom_alias is not None:
         alias = req.custom_alias
         taken = conn.execute(
@@ -113,17 +129,29 @@ def shorten(req: ShortenRequest):
                     status_code=409, detail="Custom alias taken"
                 )
         conn.execute(
-            "INSERT INTO urls (long_url, custom_alias) VALUES (?, ?)",
-            (str(req.url), alias),
+            "INSERT INTO urls (long_url, custom_alias, expires_at) "
+            "VALUES (?, ?, ?)",
+            (str(req.url), alias, expires_at),
         )
         conn.commit()
         conn.close()
-        return {"short_code": alias, "short_url": f"http://localhost:8000/{alias}"}
-    cur = conn.execute("INSERT INTO urls (long_url) VALUES (?)", (str(req.url),))
+        return {
+            "short_code": alias,
+            "short_url": f"http://localhost:8000/{alias}",
+            "expires_at": expires_at,
+        }
+    cur = conn.execute(
+        "INSERT INTO urls (long_url, expires_at) VALUES (?, ?)",
+        (str(req.url), expires_at),
+    )
     conn.commit()
     code = _encode(cur.lastrowid)
     conn.close()
-    return {"short_code": code, "short_url": f"http://localhost:8000/{code}"}
+    return {
+        "short_code": code,
+        "short_url": f"http://localhost:8000/{code}",
+        "expires_at": expires_at,
+    }
 
 
 @app.get("/{code}")

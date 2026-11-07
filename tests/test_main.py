@@ -144,3 +144,93 @@ def test_invalid_expiry_rejected():
         json={"url": "https://example.com/bad", "expires_in_seconds": -5},
     )
     assert r.status_code == 422
+
+
+def test_duplicate_url_returns_existing_code():
+    first = client.post(
+        "/api/shorten", json={"url": "https://example.com/duplicate"}
+    )
+    assert first.status_code == 200
+    code = first.json()["short_code"]
+
+    second = client.post(
+        "/api/shorten", json={"url": "https://example.com/duplicate"}
+    )
+    assert second.status_code == 200
+    assert second.json()["short_code"] == code
+
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT COUNT(*) FROM urls WHERE long_url = ?",
+        ("https://example.com/duplicate",),
+    ).fetchone()[0]
+    conn.close()
+    assert rows == 1
+
+
+def test_duplicate_url_does_not_reset_clicks():
+    r = client.post(
+        "/api/shorten", json={"url": "https://example.com/duplicate-clicks"}
+    )
+    assert r.status_code == 200
+    code = r.json()["short_code"]
+
+    client.get(f"/{code}", follow_redirects=False)
+
+    r = client.post(
+        "/api/shorten", json={"url": "https://example.com/duplicate-clicks"}
+    )
+    assert r.status_code == 200
+    assert r.json()["short_code"] == code
+
+    r = client.get(f"/api/stats/{code}")
+    assert r.json()["clicks"] == 1
+
+
+def test_duplicate_of_expired_link_creates_new_code():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/duplicate-expired",
+            "custom_alias": "dup-expired",
+        },
+    )
+    assert r.status_code == 200
+
+    past = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE urls SET expires_at = ? WHERE custom_alias = ?",
+        (past, "dup-expired"),
+    )
+    conn.commit()
+    conn.close()
+
+    r = client.post(
+        "/api/shorten", json={"url": "https://example.com/duplicate-expired"}
+    )
+    assert r.status_code == 200
+    assert r.json()["short_code"] != "dup-expired"
+
+    r = client.get(f"/{r.json()['short_code']}", follow_redirects=False)
+    assert r.status_code in (307, 308)
+
+
+def test_duplicate_url_with_same_alias_still_409():
+    first = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/duplicate-alias",
+            "custom_alias": "dup-alias",
+        },
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/duplicate-alias",
+            "custom_alias": "dup-alias",
+        },
+    )
+    assert second.status_code == 409

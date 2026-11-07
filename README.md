@@ -5,13 +5,15 @@ The point is not just a working shortener, it's the design decisions, trade-offs
 and measurements recorded along the way, so you can talk about them in an interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 3 is done (Nov 5, 2026). The project is finished when every item below is
+Day 4 is done (Nov 7, 2026). The project is finished when every item below is
 checked off, which should be around Nov 19, 2026 if no day is missed.
 
 ## What it does so far
 - `POST /api/shorten`, takes a long URL, returns a short code
 - `POST /api/shorten` with `custom_alias`, takes a user-chosen code instead
 - `POST /api/shorten` with `expires_in_seconds`, sets a lifetime for the link
+- `POST /api/shorten` for a URL that already has a live link returns the
+  existing code instead of creating a new row
 - `GET /{code}`, redirects to the original URL and records a click
 - `GET /{code}` for an expired link returns 410 Gone, and the click is not counted
 - `GET /api/stats/{code}`, total clicks for a code
@@ -34,7 +36,7 @@ pytest
 - [x] Day 1, Core API: shorten, redirect, click stats (Nov 3)
 - [x] Day 2, Custom aliases (user-chosen code, conflict returns 409) (Nov 4)
 - [x] Day 3, Link expiry (expired links return 410) (Nov 5)
-- [ ] Day 4, Duplicate URLs return the existing code
+- [x] Day 4, Duplicate URLs return the existing code (Nov 7)
 - [ ] Day 5, In-memory LRU cache in front of the database for redirects
 - [ ] Day 6, Rate limiting on shorten (per IP)
 - [ ] Day 7, Click events table (timestamp, referrer per click)
@@ -67,3 +69,10 @@ pytest
   so an expired link returns 410 on both redirect and stats, and the click
   is never counted. Expired rows are kept, not deleted, so stats history
   survives and a future cleanup job can purge them.
+- Duplicate URLs: shortening a URL that already has a live link returns the
+  existing code, so one URL maps to one code and no duplicate rows pile up.
+  The lookup is on the exact stored URL string. An expired link is not
+  reused, shortening it again creates a fresh link. A requested
+  `expires_in_seconds` is ignored when an existing live link is returned,
+  the response carries the existing link's expiry instead. Alias requests
+  are exempt: a taken alias still returns 409, even for the same URL.

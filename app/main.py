@@ -1,11 +1,13 @@
 """Day 1: URL shortener core, shorten, redirect, stats.
 Day 2: custom aliases, user-chosen code, conflict returns 409.
 Day 3: link expiry, expired links return 410.
+Day 4: duplicate URLs return the existing code.
 
 Storage is SQLite, created next to this module as urls.db on first run.
 Short codes are base62 of the row id: simple and collision-free.
 Custom aliases are stored in their own column and take precedence in lookup.
 Expiry is an optional UTC timestamp per link, set at shorten time.
+Duplicate URLs reuse the existing live link, one URL maps to one code.
 """
 import re
 import sqlite3
@@ -140,6 +142,26 @@ def shorten(req: ShortenRequest):
             "short_url": f"http://localhost:8000/{alias}",
             "expires_at": expires_at,
         }
+    existing = conn.execute(
+        "SELECT id, custom_alias, expires_at FROM urls "
+        "WHERE long_url = ? ORDER BY id LIMIT 1",
+        (str(req.url),),
+    ).fetchone()
+    if existing is not None:
+        stored_expires_at = existing[2]
+        live = stored_expires_at is None or datetime.fromisoformat(
+            stored_expires_at
+        ) > datetime.now(timezone.utc)
+        if live:
+            code = (
+                existing[1] if existing[1] is not None else _encode(existing[0])
+            )
+            conn.close()
+            return {
+                "short_code": code,
+                "short_url": f"http://localhost:8000/{code}",
+                "expires_at": stored_expires_at,
+            }
     cur = conn.execute(
         "INSERT INTO urls (long_url, expires_at) VALUES (?, ?)",
         (str(req.url), expires_at),

@@ -3,7 +3,8 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
-from app.main import DB_PATH, app
+import app.main as main_module
+from app.main import DB_PATH, app, cache_stats, redirect_cache
 
 client = TestClient(app)
 
@@ -234,3 +235,134 @@ def test_duplicate_url_with_same_alias_still_409():
         },
     )
     assert second.status_code == 409
+
+
+def test_redirect_populates_cache_and_serves_from_it():
+    r = client.post(
+        "/api/shorten", json={"url": "https://example.com/cached-link"}
+    )
+    assert r.status_code == 200
+    code = r.json()["short_code"]
+
+    r = client.get(f"/{code}", follow_redirects=False)
+    assert r.status_code in (307, 308)
+    assert code in redirect_cache
+    assert redirect_cache[code][1] == "https://example.com/cached-link"
+
+    # The database row is gone, but the redirect still works from cache.
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM urls WHERE id = ?", (redirect_cache[code][0],))
+    conn.commit()
+    conn.close()
+
+    r = client.get(f"/{code}", follow_redirects=False)
+    assert r.status_code in (307, 308)
+    assert r.headers["location"] == "https://example.com/cached-link"
+
+
+def test_cached_redirect_still_counts_clicks():
+    r = client.post(
+        "/api/shorten", json={"url": "https://example.com/cached-clicks"}
+    )
+    assert r.status_code == 200
+    code = r.json()["short_code"]
+
+    client.get(f"/{code}", follow_redirects=False)
+    client.get(f"/{code}", follow_redirects=False)
+
+    r = client.get(f"/api/stats/{code}")
+    assert r.json()["clicks"] == 2
+
+
+def test_cache_evicts_least_recently_used(monkeypatch):
+    redirect_cache.clear()
+    monkeypatch.setattr(main_module, "CACHE_MAX_SIZE", 2)
+
+    codes = []
+    for i in range(3):
+        r = client.post(
+            "/api/shorten",
+            json={"url": f"https://example.com/lru-{i}"},
+        )
+        assert r.status_code == 200
+        codes.append(r.json()["short_code"])
+
+    for code in codes:
+        r = client.get(f"/{code}", follow_redirects=False)
+        assert r.status_code in (307, 308)
+
+    assert len(redirect_cache) == 2
+    assert codes[0] not in redirect_cache
+    assert codes[1] in redirect_cache
+    assert codes[2] in redirect_cache
+
+
+def test_cache_refreshes_recency_on_hit(monkeypatch):
+    redirect_cache.clear()
+    monkeypatch.setattr(main_module, "CACHE_MAX_SIZE", 2)
+
+    codes = []
+    for i in range(2):
+        r = client.post(
+            "/api/shorten",
+            json={"url": f"https://example.com/lru-hit-{i}"},
+        )
+        assert r.status_code == 200
+        codes.append(r.json()["short_code"])
+
+    for code in codes:
+        client.get(f"/{code}", follow_redirects=False)
+
+    # Revisit the first code so it becomes most recently used.
+    client.get(f"/{codes[0]}", follow_redirects=False)
+
+    r = client.post(
+        "/api/shorten", json={"url": "https://example.com/lru-hit-2"}
+    )
+    assert r.status_code == 200
+    client.get(f"/{r.json()['short_code']}", follow_redirects=False)
+
+    assert codes[0] in redirect_cache
+    assert codes[1] not in redirect_cache
+
+
+def test_expired_link_is_not_cached():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/expired-cache",
+            "custom_alias": "expired-cache",
+        },
+    )
+    assert r.status_code == 200
+
+    past = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE urls SET expires_at = ? WHERE custom_alias = ?",
+        (past, "expired-cache"),
+    )
+    conn.commit()
+    conn.close()
+
+    r = client.get("/expired-cache", follow_redirects=False)
+    assert r.status_code == 410
+    assert "expired-cache" not in redirect_cache
+
+
+def test_cache_stats_counts_hits_and_misses():
+    before = cache_stats()
+    r = client.post(
+        "/api/shorten", json={"url": "https://example.com/cache-stats"}
+    )
+    assert r.status_code == 200
+    code = r.json()["short_code"]
+
+    client.get(f"/{code}", follow_redirects=False)
+    client.get(f"/{code}", follow_redirects=False)
+
+    after = cache_stats()
+    assert after["misses"] > before["misses"]
+    assert after["hits"] > before["hits"]
+    assert after["size"] >= 1
+    assert after["max_size"] == main_module.CACHE_MAX_SIZE

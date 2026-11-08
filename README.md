@@ -5,7 +5,7 @@ The point is not just a working shortener, it's the design decisions, trade-offs
 and measurements recorded along the way, so you can talk about them in an interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 4 is done (Nov 7, 2026). The project is finished when every item below is
+Day 5 is done (Nov 8, 2026). The project is finished when every item below is
 checked off, which should be around Nov 19, 2026 if no day is missed.
 
 ## What it does so far
@@ -15,6 +15,8 @@ checked off, which should be around Nov 19, 2026 if no day is missed.
 - `POST /api/shorten` for a URL that already has a live link returns the
   existing code instead of creating a new row
 - `GET /{code}`, redirects to the original URL and records a click
+- `GET /{code}` for a hot link is served from an in-memory LRU cache, so the
+  redirect avoids a database lookup while clicks are still counted in SQLite
 - `GET /{code}` for an expired link returns 410 Gone, and the click is not counted
 - `GET /api/stats/{code}`, total clicks for a code
 
@@ -37,7 +39,7 @@ pytest
 - [x] Day 2, Custom aliases (user-chosen code, conflict returns 409) (Nov 4)
 - [x] Day 3, Link expiry (expired links return 410) (Nov 5)
 - [x] Day 4, Duplicate URLs return the existing code (Nov 7)
-- [ ] Day 5, In-memory LRU cache in front of the database for redirects
+- [x] Day 5, In-memory LRU cache in front of the database for redirects (Nov 8)
 - [ ] Day 6, Rate limiting on shorten (per IP)
 - [ ] Day 7, Click events table (timestamp, referrer per click)
 - [ ] Day 8, Per-day click counts endpoint
@@ -76,3 +78,11 @@ pytest
   `expires_in_seconds` is ignored when an existing live link is returned,
   the response carries the existing link's expiry instead. Alias requests
   are exempt: a taken alias still returns 409, even for the same URL.
+- Redirect cache: an in-memory `OrderedDict` LRU, keyed by the requested
+  code, capped at 1000 entries, sitting in front of SQLite on the redirect
+  path only. A hit still writes the click to the database, and stats always
+  read click counts from the database, so the cache can never serve stale
+  analytics. The cached entry carries `expires_at`, checked on every hit,
+  so an expired link is evicted instead of served. No TTL yet, and a row
+  changed in the database after caching is not picked up until eviction;
+  Day 14 adds TTL plus invalidation on delete.

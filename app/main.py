@@ -2,15 +2,21 @@
 Day 2: custom aliases, user-chosen code, conflict returns 409.
 Day 3: link expiry, expired links return 410.
 Day 4: duplicate URLs return the existing code.
+Day 5: in-memory LRU cache in front of the database for redirects.
 
 Storage is SQLite, created next to this module as urls.db on first run.
 Short codes are base62 of the row id: simple and collision-free.
 Custom aliases are stored in their own column and take precedence in lookup.
 Expiry is an optional UTC timestamp per link, set at shorten time.
 Duplicate URLs reuse the existing live link, one URL maps to one code.
+Redirects are served from an in-memory LRU cache keyed by code, so a hot
+link avoids a database lookup. The database stays the source of truth:
+clicks are still incremented in SQLite on every redirect, and stats
+always read click counts from the database, never from the cache.
 """
 import re
 import sqlite3
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -22,7 +28,57 @@ DB_PATH = Path(__file__).parent / "urls.db"
 _ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+# In-memory LRU cache for redirects: code -> (row id, long_url, expires_at).
+# Bounded so a flood of distinct codes cannot grow memory without limit.
+# No TTL yet, a cached entry is checked against its stored expires_at on
+# every hit, and Day 14 adds TTL plus invalidation on delete.
+CACHE_MAX_SIZE = 1000
+redirect_cache: OrderedDict[str, tuple[int, str, str | None]] = OrderedDict()
+_cache_hits = 0
+_cache_misses = 0
+
 app = FastAPI(title="URL Shortener with Analytics")
+
+
+def cache_stats() -> dict:
+    """Return cache size, hit/miss counts, and the configured max size."""
+    return {
+        "size": len(redirect_cache),
+        "hits": _cache_hits,
+        "misses": _cache_misses,
+        "max_size": CACHE_MAX_SIZE,
+    }
+
+
+def _cache_get(code: str) -> tuple[int, str, str | None] | None:
+    """Return the cached entry for a code, or None on a miss.
+
+    A hit refreshes the entry's recency. An entry whose stored expiry has
+    passed is evicted and treated as a miss, so the caller re-checks the
+    database and returns 410.
+    """
+    global _cache_hits, _cache_misses
+    entry = redirect_cache.get(code)
+    if entry is None:
+        _cache_misses += 1
+        return None
+    _cache_hits += 1
+    expires_at = entry[2]
+    if expires_at is not None and datetime.fromisoformat(
+        expires_at
+    ) <= datetime.now(timezone.utc):
+        del redirect_cache[code]
+        return None
+    redirect_cache.move_to_end(code)
+    return entry
+
+
+def _cache_put(code: str, entry: tuple[int, str, str | None]) -> None:
+    """Store an entry, evicting the least recently used entries if full."""
+    redirect_cache[code] = entry
+    redirect_cache.move_to_end(code)
+    while len(redirect_cache) > CACHE_MAX_SIZE:
+        redirect_cache.popitem(last=False)
 
 
 def _db():
@@ -178,8 +234,19 @@ def shorten(req: ShortenRequest):
 
 @app.get("/{code}")
 def redirect(code: str):
+    cached = _cache_get(code)
+    if cached is not None:
+        row_id, long_url, _expires_at = cached
+        conn = _db()
+        conn.execute(
+            "UPDATE urls SET clicks = clicks + 1 WHERE id = ?", (row_id,)
+        )
+        conn.commit()
+        conn.close()
+        return RedirectResponse(url=long_url)
     conn = _db()
     row = _resolve(conn, code)
+    _cache_put(code, (row[0], row[1], row[3]))
     conn.execute("UPDATE urls SET clicks = clicks + 1 WHERE id = ?", (row[0],))
     conn.commit()
     conn.close()

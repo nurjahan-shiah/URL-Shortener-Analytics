@@ -5,7 +5,7 @@ The point is not just a working shortener, it's the design decisions, trade-offs
 and measurements recorded along the way, so you can talk about them in an interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 5 is done (Nov 8, 2026). The project is finished when every item below is
+Day 6 is done (Nov 9, 2026). The project is finished when every item below is
 checked off, which should be around Nov 19, 2026 if no day is missed.
 
 ## What it does so far
@@ -14,6 +14,8 @@ checked off, which should be around Nov 19, 2026 if no day is missed.
 - `POST /api/shorten` with `expires_in_seconds`, sets a lifetime for the link
 - `POST /api/shorten` for a URL that already has a live link returns the
   existing code instead of creating a new row
+- `POST /api/shorten` is rate limited to 10 requests per minute per IP,
+  further requests get 429 with a `Retry-After` header
 - `GET /{code}`, redirects to the original URL and records a click
 - `GET /{code}` for a hot link is served from an in-memory LRU cache, so the
   redirect avoids a database lookup while clicks are still counted in SQLite
@@ -40,7 +42,7 @@ pytest
 - [x] Day 3, Link expiry (expired links return 410) (Nov 5)
 - [x] Day 4, Duplicate URLs return the existing code (Nov 7)
 - [x] Day 5, In-memory LRU cache in front of the database for redirects (Nov 8)
-- [ ] Day 6, Rate limiting on shorten (per IP)
+- [x] Day 6, Rate limiting on shorten (per IP) (Nov 9)
 - [ ] Day 7, Click events table (timestamp, referrer per click)
 - [ ] Day 8, Per-day click counts endpoint
 - [ ] Day 9, Top links endpoint
@@ -86,3 +88,12 @@ pytest
   so an expired link is evicted instead of served. No TTL yet, and a row
   changed in the database after caching is not picked up until eviction;
   Day 14 adds TTL plus invalidation on delete.
+- Rate limiting: `POST /api/shorten` only, 10 requests per minute per IP,
+  sliding window over monotonic timestamps kept in memory. Over the limit
+  returns 429 with a `Retry-After` header in seconds. The IP is the first
+  entry of `X-Forwarded-For` when present, else the socket address, so the
+  limit works behind a proxy. Redirects and stats are not limited, reads
+  are cheap and a hot link should never be throttled. In-memory counters
+  reset on restart and do not share across instances; a shared store such
+  as Redis is the next step for multiple replicas. Invalid requests fail
+  validation (422) before the limiter runs, so they do not consume quota.

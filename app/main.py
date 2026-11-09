@@ -3,6 +3,7 @@ Day 2: custom aliases, user-chosen code, conflict returns 409.
 Day 3: link expiry, expired links return 410.
 Day 4: duplicate URLs return the existing code.
 Day 5: in-memory LRU cache in front of the database for redirects.
+Day 6: rate limiting on shorten, per IP, sliding window.
 
 Storage is SQLite, created next to this module as urls.db on first run.
 Short codes are base62 of the row id: simple and collision-free.
@@ -16,11 +17,12 @@ always read click counts from the database, never from the cache.
 """
 import re
 import sqlite3
+import time
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -79,6 +81,56 @@ def _cache_put(code: str, entry: tuple[int, str, str | None]) -> None:
     redirect_cache.move_to_end(code)
     while len(redirect_cache) > CACHE_MAX_SIZE:
         redirect_cache.popitem(last=False)
+
+
+# Rate limiting for shorten: a fixed number of requests per IP per sliding
+# window, kept in memory. In-memory means the counters reset on restart and
+# do not survive across instances, which is fine for a single process; a
+# shared store (Redis) would be the next step for multiple replicas.
+RATE_LIMIT_MAX_REQUESTS = 10
+RATE_LIMIT_WINDOW_SECONDS = 60
+
+# Per-IP list of monotonic timestamps of accepted shorten requests.
+_rate_limit_store: dict[str, list[float]] = {}
+
+
+def reset_rate_limits() -> None:
+    """Clear all per-IP rate limit state. Used by tests."""
+    _rate_limit_store.clear()
+
+
+def _client_ip(request: Request) -> str:
+    """Identify the caller for rate limiting.
+
+    Prefer the first entry of X-Forwarded-For when present, since the app
+    usually sits behind a proxy and the socket address would then be the
+    proxy, not the caller. Fall back to the socket address.
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _check_rate_limit(client_ip: str) -> None:
+    """Record one shorten request for an IP, or raise 429 if over the limit.
+
+    Uses a sliding window: only requests inside the last
+    RATE_LIMIT_WINDOW_SECONDS count. The 429 carries a Retry-After header
+    in seconds, so a well-behaved client knows when to retry.
+    """
+    now = time.monotonic()
+    window_start = now - RATE_LIMIT_WINDOW_SECONDS
+    timestamps = _rate_limit_store.setdefault(client_ip, [])
+    timestamps[:] = [t for t in timestamps if t > window_start]
+    if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
+        retry_after = int(RATE_LIMIT_WINDOW_SECONDS - (now - timestamps[0])) + 1
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded, try again later",
+            headers={"Retry-After": str(retry_after)},
+        )
+    timestamps.append(now)
 
 
 def _db():
@@ -157,7 +209,8 @@ class ShortenRequest(BaseModel):
 
 
 @app.post("/api/shorten")
-def shorten(req: ShortenRequest):
+def shorten(req: ShortenRequest, request: Request):
+    _check_rate_limit(_client_ip(request))
     conn = _db()
     expires_at = None
     if req.expires_in_seconds is not None:
@@ -259,3 +312,4 @@ def stats(code: str):
     row = _resolve(conn, code)
     conn.close()
     return {"short_code": code, "long_url": row[1], "clicks": row[2]}
+

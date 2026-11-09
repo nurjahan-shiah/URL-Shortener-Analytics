@@ -1,12 +1,19 @@
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main_module
 from app.main import DB_PATH, app, cache_stats, redirect_cache
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    """Each test starts with a clean per-IP rate limit store."""
+    main_module.reset_rate_limits()
 
 
 def test_shorten_redirect_and_stats():
@@ -366,3 +373,68 @@ def test_cache_stats_counts_hits_and_misses():
     assert after["hits"] > before["hits"]
     assert after["size"] >= 1
     assert after["max_size"] == main_module.CACHE_MAX_SIZE
+
+
+def test_shorten_rate_limit_blocks_after_limit(monkeypatch):
+    monkeypatch.setattr(main_module, "RATE_LIMIT_MAX_REQUESTS", 3)
+
+    for i in range(3):
+        r = client.post(
+            "/api/shorten",
+            json={"url": f"https://example.com/rate-limited-{i}"},
+        )
+        assert r.status_code == 200
+
+    r = client.post(
+        "/api/shorten", json={"url": "https://example.com/rate-limited-3"}
+    )
+    assert r.status_code == 429
+    assert "retry-after" in r.headers
+    assert int(r.headers["retry-after"]) > 0
+
+
+def test_rate_limit_is_per_ip(monkeypatch):
+    monkeypatch.setattr(main_module, "RATE_LIMIT_MAX_REQUESTS", 2)
+    headers_a = {"X-Forwarded-For": "203.0.113.1"}
+    headers_b = {"X-Forwarded-For": "203.0.113.2"}
+
+    for i in range(2):
+        r = client.post(
+            "/api/shorten",
+            json={"url": f"https://example.com/per-ip-a-{i}"},
+            headers=headers_a,
+        )
+        assert r.status_code == 200
+
+    r = client.post(
+        "/api/shorten",
+        json={"url": "https://example.com/per-ip-a-3"},
+        headers=headers_a,
+    )
+    assert r.status_code == 429
+
+    r = client.post(
+        "/api/shorten",
+        json={"url": "https://example.com/per-ip-b"},
+        headers=headers_b,
+    )
+    assert r.status_code == 200
+
+
+def test_rate_limit_does_not_block_redirects(monkeypatch):
+    monkeypatch.setattr(main_module, "RATE_LIMIT_MAX_REQUESTS", 1)
+
+    r = client.post(
+        "/api/shorten", json={"url": "https://example.com/rate-redirect"}
+    )
+    assert r.status_code == 200
+    code = r.json()["short_code"]
+
+    r = client.post(
+        "/api/shorten", json={"url": "https://example.com/rate-redirect-2"}
+    )
+    assert r.status_code == 429
+
+    r = client.get(f"/{code}", follow_redirects=False)
+    assert r.status_code in (307, 308)
+

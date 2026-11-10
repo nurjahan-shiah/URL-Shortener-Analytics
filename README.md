@@ -5,7 +5,7 @@ The point is not just a working shortener, it's the design decisions, trade-offs
 and measurements recorded along the way, so you can talk about them in an interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 6 is done (Nov 9, 2026). The project is finished when every item below is
+Day 7 is done (Nov 10, 2026). The project is finished when every item below is
 checked off, which should be around Nov 19, 2026 if no day is missed.
 
 ## What it does so far
@@ -20,6 +20,8 @@ checked off, which should be around Nov 19, 2026 if no day is missed.
 - `GET /{code}` for a hot link is served from an in-memory LRU cache, so the
   redirect avoids a database lookup while clicks are still counted in SQLite
 - `GET /{code}` for an expired link returns 410 Gone, and the click is not counted
+- `GET /{code}` records a click event (UTC timestamp, referrer from the
+  `Referer` header) in the `click_events` table on every redirect
 - `GET /api/stats/{code}`, total clicks for a code
 
 ## Stack
@@ -43,7 +45,7 @@ pytest
 - [x] Day 4, Duplicate URLs return the existing code (Nov 7)
 - [x] Day 5, In-memory LRU cache in front of the database for redirects (Nov 8)
 - [x] Day 6, Rate limiting on shorten (per IP) (Nov 9)
-- [ ] Day 7, Click events table (timestamp, referrer per click)
+- [x] Day 7, Click events table (timestamp, referrer per click) (Nov 10)
 - [ ] Day 8, Per-day click counts endpoint
 - [ ] Day 9, Top links endpoint
 - [ ] Day 10, Deactivate / delete a link
@@ -58,8 +60,16 @@ pytest
 ## Design decisions (log them here as you go)
 - Short codes: base62 of an auto-incrementing id, simple, collision-free, but
   predictable. Custom aliases (Day 2) are the user-facing answer to that.
-- Clicks: recorded on redirect, not on shorten. Analytics are aggregated
-  per day, not stored as one row per click forever.
+- Clicks: recorded on redirect, not on shorten. Every redirect appends one
+  row to `click_events` (UTC timestamp, referrer from the `Referer` header,
+  null when the header is absent), so per-day counts and referrer breakdowns
+  can be derived later instead of pre-aggregated. The `urls.clicks` counter
+  stays as the cheap total, and the two agree. An index on
+  `(url_id, clicked_at)` keeps per-link, per-day queries fast. Events are
+  append-only with no enforced foreign key, so a redirect served from the
+  cache for a deleted row still records its event. Keeping one row per click
+  forever grows the table without bound; a retention or rollup job is the
+  next step once traffic justifies it.
 - Caching: hot links will be cached in front of the database; the database
   stays the source of truth.
 - Unknown short codes return 404, including codes that decode to out-of-range

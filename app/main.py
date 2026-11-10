@@ -4,6 +4,7 @@ Day 3: link expiry, expired links return 410.
 Day 4: duplicate URLs return the existing code.
 Day 5: in-memory LRU cache in front of the database for redirects.
 Day 6: rate limiting on shorten, per IP, sliding window.
+Day 7: click events table, one row per redirect with timestamp and referrer.
 
 Storage is SQLite, created next to this module as urls.db on first run.
 Short codes are base62 of the row id: simple and collision-free.
@@ -146,8 +147,35 @@ def _db():
         conn.execute("ALTER TABLE urls ADD COLUMN custom_alias TEXT UNIQUE")
     if "expires_at" not in columns:
         conn.execute("ALTER TABLE urls ADD COLUMN expires_at TEXT")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS click_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "url_id INTEGER NOT NULL, "
+        "clicked_at TEXT NOT NULL, "
+        "referrer TEXT)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_click_events_url_time "
+        "ON click_events (url_id, clicked_at)"
+    )
     conn.commit()
     return conn
+
+
+def _record_click(conn, url_id: int, referrer: str | None) -> None:
+    """Append one click event row for a redirect.
+
+    The timestamp is UTC, ISO format. The referrer comes from the
+    request's Referer header and is None when the header is absent.
+    Events are append-only, and the table deliberately has no enforced
+    foreign key, so a redirect served from the cache for a row that was
+    deleted still records its event instead of failing.
+    """
+    conn.execute(
+        "INSERT INTO click_events (url_id, clicked_at, referrer) "
+        "VALUES (?, ?, ?)",
+        (url_id, datetime.now(timezone.utc).isoformat(), referrer),
+    )
 
 
 def _encode(n: int) -> str:
@@ -286,7 +314,7 @@ def shorten(req: ShortenRequest, request: Request):
 
 
 @app.get("/{code}")
-def redirect(code: str):
+def redirect(code: str, request: Request):
     cached = _cache_get(code)
     if cached is not None:
         row_id, long_url, _expires_at = cached
@@ -294,6 +322,7 @@ def redirect(code: str):
         conn.execute(
             "UPDATE urls SET clicks = clicks + 1 WHERE id = ?", (row_id,)
         )
+        _record_click(conn, row_id, request.headers.get("referer"))
         conn.commit()
         conn.close()
         return RedirectResponse(url=long_url)
@@ -301,6 +330,7 @@ def redirect(code: str):
     row = _resolve(conn, code)
     _cache_put(code, (row[0], row[1], row[3]))
     conn.execute("UPDATE urls SET clicks = clicks + 1 WHERE id = ?", (row[0],))
+    _record_click(conn, row[0], request.headers.get("referer"))
     conn.commit()
     conn.close()
     return RedirectResponse(url=row[1])
@@ -312,4 +342,5 @@ def stats(code: str):
     row = _resolve(conn, code)
     conn.close()
     return {"short_code": code, "long_url": row[1], "clicks": row[2]}
+
 

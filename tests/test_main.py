@@ -438,3 +438,153 @@ def test_rate_limit_does_not_block_redirects(monkeypatch):
     r = client.get(f"/{code}", follow_redirects=False)
     assert r.status_code in (307, 308)
 
+
+def test_click_events_table_schema():
+    conn = sqlite3.connect(DB_PATH)
+    columns = {
+        row[1]: row[2]
+        for row in conn.execute("PRAGMA table_info(click_events)")
+    }
+    conn.close()
+    assert columns == {
+        "id": "INTEGER",
+        "url_id": "INTEGER",
+        "clicked_at": "TEXT",
+        "referrer": "TEXT",
+    }
+
+
+def _click_events_for(code: str):
+    """Return all click event rows for a code, oldest first."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, url_id, clicked_at, referrer FROM click_events "
+        "WHERE url_id = (SELECT id FROM urls WHERE custom_alias = ? "
+        "OR id = ?) ORDER BY id",
+        (code, code),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def test_redirect_records_click_event_with_timestamp_and_referrer():
+    before = datetime.now(timezone.utc)
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/event-referrer",
+            "custom_alias": "event-referrer",
+        },
+    )
+    assert r.status_code == 200
+
+    r = client.get(
+        "/event-referrer",
+        headers={"Referer": "https://example.com/some-page"},
+        follow_redirects=False,
+    )
+    assert r.status_code in (307, 308)
+
+    events = _click_events_for("event-referrer")
+    assert len(events) == 1
+    _, url_id, clicked_at, referrer = events[0]
+    assert url_id is not None
+    assert referrer == "https://example.com/some-page"
+    clicked = datetime.fromisoformat(clicked_at)
+    assert clicked.tzinfo is not None
+    assert before <= clicked <= datetime.now(timezone.utc)
+
+
+def test_click_event_without_referrer_stores_null():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/event-no-referrer",
+            "custom_alias": "event-no-referrer",
+        },
+    )
+    assert r.status_code == 200
+
+    r = client.get("/event-no-referrer", follow_redirects=False)
+    assert r.status_code in (307, 308)
+
+    events = _click_events_for("event-no-referrer")
+    assert len(events) == 1
+    assert events[0][3] is None
+
+
+def test_each_redirect_records_its_own_event():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/event-many",
+            "custom_alias": "event-many",
+        },
+    )
+    assert r.status_code == 200
+
+    for i in range(3):
+        r = client.get(
+            "/event-many",
+            headers={"Referer": f"https://example.com/page-{i}"},
+            follow_redirects=False,
+        )
+        assert r.status_code in (307, 308)
+
+    events = _click_events_for("event-many")
+    assert len(events) == 3
+    assert [e[3] for e in events] == [
+        "https://example.com/page-0",
+        "https://example.com/page-1",
+        "https://example.com/page-2",
+    ]
+    # The total counter on the link row still agrees with the event rows.
+    r = client.get("/api/stats/event-many")
+    assert r.json()["clicks"] == 3
+
+
+def test_cached_redirect_records_click_event():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/event-cached",
+            "custom_alias": "event-cached",
+        },
+    )
+    assert r.status_code == 200
+
+    # First redirect misses the cache, the second is served from it.
+    client.get("/event-cached", follow_redirects=False)
+    r = client.get("/event-cached", follow_redirects=False)
+    assert r.status_code in (307, 308)
+
+    events = _click_events_for("event-cached")
+    assert len(events) == 2
+
+
+def test_expired_link_records_no_click_event():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/event-expired",
+            "custom_alias": "event-expired",
+        },
+    )
+    assert r.status_code == 200
+
+    past = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE urls SET expires_at = ? WHERE custom_alias = ?",
+        (past, "event-expired"),
+    )
+    conn.commit()
+    conn.close()
+
+    r = client.get("/event-expired", follow_redirects=False)
+    assert r.status_code == 410
+
+    events = _click_events_for("event-expired")
+    assert events == []
+
+

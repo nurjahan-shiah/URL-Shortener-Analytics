@@ -5,7 +5,7 @@ The point is not just a working shortener, it's the design decisions, trade-offs
 and measurements recorded along the way, so you can talk about them in an interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 7 is done (Nov 10, 2026). The project is finished when every item below is
+Day 8 is done (Nov 11, 2026). The project is finished when every item below is
 checked off, which should be around Nov 19, 2026 if no day is missed.
 
 ## What it does so far
@@ -23,6 +23,9 @@ checked off, which should be around Nov 19, 2026 if no day is missed.
 - `GET /{code}` records a click event (UTC timestamp, referrer from the
   `Referer` header) in the `click_events` table on every redirect
 - `GET /api/stats/{code}`, total clicks for a code
+- `GET /api/stats/{code}/per-day`, click counts per UTC day, zero-filled
+  across the requested range, defaults to the last 30 days including today;
+  `start_date` and `end_date` query params take YYYY-MM-DD dates
 
 ## Stack
 Python, FastAPI, SQLite (for now; a caching layer arrives in Week 2).
@@ -46,7 +49,7 @@ pytest
 - [x] Day 5, In-memory LRU cache in front of the database for redirects (Nov 8)
 - [x] Day 6, Rate limiting on shorten (per IP) (Nov 9)
 - [x] Day 7, Click events table (timestamp, referrer per click) (Nov 10)
-- [ ] Day 8, Per-day click counts endpoint
+- [x] Day 8, Per-day click counts endpoint (Nov 11)
 - [ ] Day 9, Top links endpoint
 - [ ] Day 10, Deactivate / delete a link
 - [ ] Day 11, List links with pagination
@@ -107,3 +110,13 @@ pytest
   reset on restart and do not share across instances; a shared store such
   as Redis is the next step for multiple replicas. Invalid requests fail
   validation (422) before the limiter runs, so they do not consume quota.
+- Per-day counts: derived from the `click_events` table with one SQL query,
+  `GROUP BY date(clicked_at)` over the requested range, so the per-day
+  numbers always add up to the total in `/api/stats`. Dates are UTC days,
+  matching how events are timestamped. The response zero-fills days with
+  no clicks, so a caller can plot it without filling gaps itself. The
+  default window is the last 30 days; an explicit `start_date`/`end_date`
+  is capped at 365 days to keep one request from forcing a huge response.
+  A bad range (start after end, or an impossible date) returns 422, and
+  unknown or expired codes behave like the other stats endpoint (404/410).
+

@@ -588,3 +588,186 @@ def test_expired_link_records_no_click_event():
     assert events == []
 
 
+def _insert_click_events(alias: str, clicked_ats: list[str]) -> None:
+    """Insert click event rows with the given ISO timestamps for a link."""
+    conn = sqlite3.connect(DB_PATH)
+    url_id = conn.execute(
+        "SELECT id FROM urls WHERE custom_alias = ?", (alias,)
+    ).fetchone()[0]
+    for clicked_at in clicked_ats:
+        conn.execute(
+            "INSERT INTO click_events (url_id, clicked_at, referrer) "
+            "VALUES (?, ?, ?)",
+            (url_id, clicked_at, None),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_per_day_counts_group_clicks_by_day():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/per-day",
+            "custom_alias": "per-day",
+        },
+    )
+    assert r.status_code == 200
+
+    today = datetime.now(timezone.utc).date()
+    yesterday = today - timedelta(days=1)
+    two_days_ago = today - timedelta(days=2)
+    _insert_click_events(
+        "per-day",
+        [
+            datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+            .isoformat(),
+            datetime.combine(
+                yesterday, datetime.min.time(), tzinfo=timezone.utc
+            ).isoformat(),
+            datetime.combine(
+                yesterday, datetime.min.time(), tzinfo=timezone.utc
+            ).isoformat(),
+        ],
+    )
+
+    r = client.get(
+        "/api/stats/per-day/per-day",
+        params={
+            "start_date": two_days_ago.isoformat(),
+            "end_date": today.isoformat(),
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["short_code"] == "per-day"
+    assert body["start_date"] == two_days_ago.isoformat()
+    assert body["end_date"] == today.isoformat()
+    assert body["total_clicks"] == 3
+    assert body["per_day"] == [
+        {"date": two_days_ago.isoformat(), "clicks": 0},
+        {"date": yesterday.isoformat(), "clicks": 2},
+        {"date": today.isoformat(), "clicks": 1},
+    ]
+
+
+def test_per_day_defaults_to_last_30_days():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/per-day-default",
+            "custom_alias": "per-day-default",
+        },
+    )
+    assert r.status_code == 200
+    client.get("/per-day-default", follow_redirects=False)
+
+    today = datetime.now(timezone.utc).date()
+    r = client.get("/api/stats/per-day-default/per-day")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["start_date"] == (today - timedelta(days=29)).isoformat()
+    assert body["end_date"] == today.isoformat()
+    assert len(body["per_day"]) == 30
+    assert body["total_clicks"] == 1
+    assert body["per_day"][-1] == {"date": today.isoformat(), "clicks": 1}
+    assert all(entry["clicks"] == 0 for entry in body["per_day"][:-1])
+
+
+def test_per_day_agrees_with_total_stats():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/per-day-total",
+            "custom_alias": "per-day-total",
+        },
+    )
+    assert r.status_code == 200
+
+    for _ in range(3):
+        client.get("/per-day-total", follow_redirects=False)
+
+    r = client.get("/api/stats/per-day-total/per-day")
+    assert r.status_code == 200
+    assert r.json()["total_clicks"] == 3
+
+    r = client.get("/api/stats/per-day-total")
+    assert r.json()["clicks"] == 3
+
+
+def test_per_day_unknown_code_404():
+    assert (
+        client.get("/api/stats/doesnotexist123/per-day").status_code == 404
+    )
+
+
+def test_per_day_expired_link_410():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/per-day-expired",
+            "custom_alias": "per-day-expired",
+        },
+    )
+    assert r.status_code == 200
+
+    past = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE urls SET expires_at = ? WHERE custom_alias = ?",
+        (past, "per-day-expired"),
+    )
+    conn.commit()
+    conn.close()
+
+    r = client.get("/api/stats/per-day-expired/per-day")
+    assert r.status_code == 410
+
+
+def test_per_day_rejects_start_after_end():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/per-day-range",
+            "custom_alias": "per-day-range",
+        },
+    )
+    assert r.status_code == 200
+
+    r = client.get(
+        "/api/stats/per-day-range/per-day",
+        params={"start_date": "2026-11-11", "end_date": "2026-11-10"},
+    )
+    assert r.status_code == 422
+
+
+def test_per_day_rejects_bad_date_and_wide_range():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/per-day-bad-range",
+            "custom_alias": "per-day-bad-range",
+        },
+    )
+    assert r.status_code == 200
+
+    r = client.get(
+        "/api/stats/per-day-bad-range/per-day",
+        params={"start_date": "2026-02-30", "end_date": "2026-03-01"},
+    )
+    assert r.status_code == 422
+
+    r = client.get(
+        "/api/stats/per-day-bad-range/per-day",
+        params={"start_date": "not-a-date", "end_date": "2026-03-01"},
+    )
+    assert r.status_code == 422
+
+    r = client.get(
+        "/api/stats/per-day-bad-range/per-day",
+        params={"start_date": "2025-01-01", "end_date": "2026-12-31"},
+    )
+    assert r.status_code == 422
+
+
+

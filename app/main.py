@@ -5,6 +5,7 @@ Day 4: duplicate URLs return the existing code.
 Day 5: in-memory LRU cache in front of the database for redirects.
 Day 6: rate limiting on shorten, per IP, sliding window.
 Day 7: click events table, one row per redirect with timestamp and referrer.
+Day 8: per-day click counts endpoint, click events grouped by UTC date.
 
 Storage is SQLite, created next to this module as urls.db on first run.
 Short codes are base62 of the row id: simple and collision-free.
@@ -23,7 +24,7 @@ from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -342,5 +343,88 @@ def stats(code: str):
     row = _resolve(conn, code)
     conn.close()
     return {"short_code": code, "long_url": row[1], "clicks": row[2]}
+
+
+# Per-day click counts: how many days of history to return when the caller
+# does not pass a date range, and the widest range a caller may ask for.
+# A 365-day cap keeps one request from forcing a huge zero-filled response.
+PER_DAY_DEFAULT_DAYS = 30
+PER_DAY_MAX_DAYS = 365
+
+
+def _parse_date(value: str) -> "datetime.date":
+    """Parse a YYYY-MM-DD date, or raise 422 for an impossible calendar date."""
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid date: {value}"
+        )
+
+
+@app.get("/api/stats/{code}/per-day")
+def per_day_stats(
+    code: str,
+    start_date: str | None = Query(
+        default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"
+    ),
+    end_date: str | None = Query(
+        default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"
+    ),
+):
+    """Return click counts per UTC day for a link, zero-filled across the range.
+
+    The counts come from the click_events table (Day 7), grouped by the UTC
+    date of each event, so they agree with the total in /api/stats. The
+    default window is the last 30 days including today; pass start_date and
+    end_date (YYYY-MM-DD, inclusive) for another window. Days with no clicks
+    are included with a count of 0, so the result can be plotted directly.
+    An unknown code returns 404 and an expired link returns 410, matching
+    the other stats endpoint.
+    """
+    conn = _db()
+    row = _resolve(conn, code)
+    today = datetime.now(timezone.utc).date()
+    end = _parse_date(end_date) if end_date is not None else today
+    start = (
+        _parse_date(start_date)
+        if start_date is not None
+        else end - timedelta(days=PER_DAY_DEFAULT_DAYS - 1)
+    )
+    if start > end:
+        conn.close()
+        raise HTTPException(
+            status_code=422,
+            detail="start_date must not be after end_date",
+        )
+    if (end - start).days + 1 > PER_DAY_MAX_DAYS:
+        conn.close()
+        raise HTTPException(
+            status_code=422,
+            detail="Date range must be at most 365 days",
+        )
+    rows = conn.execute(
+        "SELECT date(clicked_at) AS day, COUNT(*) FROM click_events "
+        "WHERE url_id = ? AND date(clicked_at) BETWEEN ? AND ? "
+        "GROUP BY day ORDER BY day",
+        (row[0], start.isoformat(), end.isoformat()),
+    ).fetchall()
+    conn.close()
+    counts = {day: count for day, count in rows}
+    per_day = []
+    day = start
+    while day <= end:
+        per_day.append(
+            {"date": day.isoformat(), "clicks": counts.get(day.isoformat(), 0)}
+        )
+        day += timedelta(days=1)
+    return {
+        "short_code": code,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "total_clicks": sum(counts.values()),
+        "per_day": per_day,
+    }
+
 
 

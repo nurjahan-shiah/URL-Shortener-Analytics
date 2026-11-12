@@ -770,4 +770,107 @@ def test_per_day_rejects_bad_date_and_wide_range():
     assert r.status_code == 422
 
 
+def test_top_links_orders_by_clicks():
+    for alias, clicks in [
+        ("top-a", 3),
+        ("top-b", 1),
+        ("top-c", 5),
+    ]:
+        r = client.post(
+            "/api/shorten",
+            json={
+                "url": f"https://example.com/{alias}",
+                "custom_alias": alias,
+            },
+        )
+        assert r.status_code == 200
+        for _ in range(clicks):
+            client.get(f"/{alias}", follow_redirects=False)
+
+    r = client.get("/api/stats/top", params={"limit": 100})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["limit"] == 100
+    mine = [link for link in body["links"] if link["short_code"] in ("top-a", "top-b", "top-c")]
+    assert [link["short_code"] for link in mine] == ["top-c", "top-a", "top-b"]
+    assert [link["clicks"] for link in mine] == [5, 3, 1]
+    assert mine[0]["long_url"] == "https://example.com/top-c"
+
+
+def test_top_links_limit_and_descending_order():
+    r = client.get("/api/stats/top", params={"limit": 2})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["limit"] == 2
+    assert len(body["links"]) == 2
+    clicks = [link["clicks"] for link in body["links"]]
+    assert clicks == sorted(clicks, reverse=True)
+
+
+def test_top_links_default_limit_and_validation():
+    r = client.get("/api/stats/top")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["limit"] == 10
+    assert len(body["links"]) <= 10
+
+    assert client.get("/api/stats/top", params={"limit": 0}).status_code == 422
+    assert client.get("/api/stats/top", params={"limit": 101}).status_code == 422
+
+
+def test_top_links_excludes_expired():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/top-expired",
+            "custom_alias": "top-expired",
+        },
+    )
+    assert r.status_code == 200
+    for _ in range(5):
+        client.get("/top-expired", follow_redirects=False)
+
+    past = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE urls SET expires_at = ? WHERE custom_alias = ?",
+        (past, "top-expired"),
+    )
+    conn.commit()
+    conn.close()
+
+    r = client.get("/api/stats/top", params={"limit": 100})
+    assert r.status_code == 200
+    assert all(
+        link["short_code"] != "top-expired" for link in r.json()["links"]
+    )
+
+
+def test_top_links_shows_alias_and_generated_code():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/top-alias",
+            "custom_alias": "top-alias",
+        },
+    )
+    assert r.status_code == 200
+    client.get("/top-alias", follow_redirects=False)
+
+    r = client.post(
+        "/api/shorten", json={"url": "https://example.com/top-generated"}
+    )
+    assert r.status_code == 200
+    generated = r.json()["short_code"]
+    client.get(f"/{generated}", follow_redirects=False)
+
+    r = client.get("/api/stats/top", params={"limit": 100})
+    assert r.status_code == 200
+    by_code = {link["short_code"]: link for link in r.json()["links"]}
+    assert by_code["top-alias"]["clicks"] == 1
+    assert by_code["top-alias"]["long_url"] == "https://example.com/top-alias"
+    assert by_code[generated]["clicks"] == 1
+    assert by_code[generated]["long_url"] == "https://example.com/top-generated"
+
+
 

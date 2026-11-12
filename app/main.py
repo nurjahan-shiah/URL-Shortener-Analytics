@@ -6,6 +6,7 @@ Day 5: in-memory LRU cache in front of the database for redirects.
 Day 6: rate limiting on shorten, per IP, sliding window.
 Day 7: click events table, one row per redirect with timestamp and referrer.
 Day 8: per-day click counts endpoint, click events grouped by UTC date.
+Day 9: top links endpoint, most-clicked live links first.
 
 Storage is SQLite, created next to this module as urls.db on first run.
 Short codes are base62 of the row id: simple and collision-free.
@@ -335,6 +336,46 @@ def redirect(code: str, request: Request):
     conn.commit()
     conn.close()
     return RedirectResponse(url=row[1])
+
+
+# Top links: how many links to return when the caller does not pass a
+# limit, and the most a caller may ask for in one request. A 100 cap keeps
+# one request from forcing a huge response.
+TOP_LINKS_DEFAULT_LIMIT = 10
+TOP_LINKS_MAX_LIMIT = 100
+
+
+@app.get("/api/stats/top")
+def top_links(
+    limit: int = Query(default=TOP_LINKS_DEFAULT_LIMIT, ge=1, le=TOP_LINKS_MAX_LIMIT),
+):
+    """Return the most-clicked live links, most clicks first.
+
+    The ranking reads the urls.clicks counter, which is incremented on
+    every redirect, so it always agrees with /api/stats. Ties are broken
+    by the oldest link first, so the order is stable. Expired links are
+    left out, since they no longer redirect and return 410 elsewhere.
+    The short_code is the custom alias when one was set, else the
+    generated base62 code. A limit outside 1 to 100 returns 422.
+    """
+    conn = _db()
+    now = datetime.now(timezone.utc).isoformat()
+    rows = conn.execute(
+        "SELECT id, long_url, clicks, custom_alias FROM urls "
+        "WHERE expires_at IS NULL OR expires_at > ? "
+        "ORDER BY clicks DESC, id ASC LIMIT ?",
+        (now, limit),
+    ).fetchall()
+    conn.close()
+    links = [
+        {
+            "short_code": row[3] if row[3] is not None else _encode(row[0]),
+            "long_url": row[1],
+            "clicks": row[2],
+        }
+        for row in rows
+    ]
+    return {"limit": limit, "links": links}
 
 
 @app.get("/api/stats/{code}")

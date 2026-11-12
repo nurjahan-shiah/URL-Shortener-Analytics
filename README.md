@@ -5,7 +5,7 @@ The point is not just a working shortener, it's the design decisions, trade-offs
 and measurements recorded along the way, so you can talk about them in an interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 8 is done (Nov 11, 2026). The project is finished when every item below is
+Day 9 is done (Nov 12, 2026). The project is finished when every item below is
 checked off, which should be around Nov 19, 2026 if no day is missed.
 
 ## What it does so far
@@ -26,6 +26,8 @@ checked off, which should be around Nov 19, 2026 if no day is missed.
 - `GET /api/stats/{code}/per-day`, click counts per UTC day, zero-filled
   across the requested range, defaults to the last 30 days including today;
   `start_date` and `end_date` query params take YYYY-MM-DD dates
+- `GET /api/stats/top`, the most-clicked live links, most clicks first;
+  `limit` query param, default 10, max 100
 
 ## Stack
 Python, FastAPI, SQLite (for now; a caching layer arrives in Week 2).
@@ -50,7 +52,7 @@ pytest
 - [x] Day 6, Rate limiting on shorten (per IP) (Nov 9)
 - [x] Day 7, Click events table (timestamp, referrer per click) (Nov 10)
 - [x] Day 8, Per-day click counts endpoint (Nov 11)
-- [ ] Day 9, Top links endpoint
+- [x] Day 9, Top links endpoint (Nov 12)
 - [ ] Day 10, Deactivate / delete a link
 - [ ] Day 11, List links with pagination
 - [ ] Day 12, URL validation hardening + extra tests
@@ -119,4 +121,12 @@ pytest
   is capped at 365 days to keep one request from forcing a huge response.
   A bad range (start after end, or an impossible date) returns 422, and
   unknown or expired codes behave like the other stats endpoint (404/410).
+- Top links: one SQL query over `urls`, ordered by `clicks DESC, id ASC`
+  with a `LIMIT`, so the ranking always agrees with `/api/stats` and ties
+  resolve to the oldest link first for a stable order. Expired links are
+  filtered out in the query, since they no longer redirect and return 410
+  elsewhere. The endpoint is registered before `/api/stats/{code}`, so the
+  literal path `/api/stats/top` is not swallowed as a short code. The
+  default limit is 10 and the max is 100, so one request cannot force a
+  huge response; a limit outside 1 to 100 returns 422.
 

@@ -5,7 +5,7 @@ The point is not just a working shortener, it's the design decisions, trade-offs
 and measurements recorded along the way, so you can talk about them in an interview.
 
 **Status:** In progress, one feature per day, pushed daily.
-Day 9 is done (Nov 12, 2026). The project is finished when every item below is
+Day 10 is done (Nov 13, 2026). The project is finished when every item below is
 checked off, which should be around Nov 19, 2026 if no day is missed.
 
 ## What it does so far
@@ -28,6 +28,9 @@ checked off, which should be around Nov 19, 2026 if no day is missed.
   `start_date` and `end_date` query params take YYYY-MM-DD dates
 - `GET /api/stats/top`, the most-clicked live links, most clicks first;
   `limit` query param, default 10, max 100
+- `DELETE /api/links/{code}`, deactivates a link (soft delete). The link
+  then returns 410 Gone on redirect and stats, is left out of top links,
+  and shortening the same URL again creates a fresh link
 
 ## Stack
 Python, FastAPI, SQLite (for now; a caching layer arrives in Week 2).
@@ -53,7 +56,7 @@ pytest
 - [x] Day 7, Click events table (timestamp, referrer per click) (Nov 10)
 - [x] Day 8, Per-day click counts endpoint (Nov 11)
 - [x] Day 9, Top links endpoint (Nov 12)
-- [ ] Day 10, Deactivate / delete a link
+- [x] Day 10, Deactivate / delete a link (Nov 13)
 - [ ] Day 11, List links with pagination
 - [ ] Day 12, URL validation hardening + extra tests
 - [ ] Day 13, Analytics summary endpoint (totals, top link)
@@ -129,4 +132,16 @@ pytest
   literal path `/api/stats/top` is not swallowed as a short code. The
   default limit is 10 and the max is 100, so one request cannot force a
   huge response; a limit outside 1 to 100 returns 422.
+- Deactivation: a soft delete, an `is_active` flag on the row, not a
+  `DELETE` of the row, so click history survives and stats stay
+  consistent. A deactivated link returns 410 on redirect, stats and
+  per-day stats, the same status as an expired link, and is filtered out
+  of top links. The check lives in the shared resolver, so all three
+  endpoints agree. Deleting is idempotent, a second delete returns 200
+  again, and an unknown code returns 404. The custom alias stays
+  reserved, so reusing it still returns 409, and shortening the same URL
+  again creates a fresh link instead of reviving the old one. The cached
+  redirect entries (under both the alias and the generated code) are
+  evicted on delete, so the link stops working at once; the cache TTL
+  that Day 14 adds is separate from this invalidation.
 

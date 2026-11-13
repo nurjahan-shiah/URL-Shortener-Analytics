@@ -7,6 +7,8 @@ Day 6: rate limiting on shorten, per IP, sliding window.
 Day 7: click events table, one row per redirect with timestamp and referrer.
 Day 8: per-day click counts endpoint, click events grouped by UTC date.
 Day 9: top links endpoint, most-clicked live links first.
+Day 10: deactivate / delete a link, soft delete, redirect and stats
+return 410 afterwards.
 
 Storage is SQLite, created next to this module as urls.db on first run.
 Short codes are base62 of the row id: simple and collision-free.
@@ -86,6 +88,18 @@ def _cache_put(code: str, entry: tuple[int, str, str | None]) -> None:
         redirect_cache.popitem(last=False)
 
 
+def _cache_invalidate(row_id: int, custom_alias: str | None) -> None:
+    """Drop every cached entry for a link, by generated code and alias.
+
+    A link can be cached under either key, depending on which code the
+    redirect used, so both are removed. Called on delete so a deactivated
+    link stops redirecting at once instead of lingering in the cache.
+    """
+    redirect_cache.pop(_encode(row_id), None)
+    if custom_alias is not None:
+        redirect_cache.pop(custom_alias, None)
+
+
 # Rate limiting for shorten: a fixed number of requests per IP per sliding
 # window, kept in memory. In-memory means the counters reset on restart and
 # do not survive across instances, which is fine for a single process; a
@@ -142,13 +156,18 @@ def _db():
         "CREATE TABLE IF NOT EXISTS urls ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "long_url TEXT NOT NULL, clicks INTEGER NOT NULL DEFAULT 0, "
-        "custom_alias TEXT UNIQUE, expires_at TEXT)"
+        "custom_alias TEXT UNIQUE, expires_at TEXT, "
+        "is_active INTEGER NOT NULL DEFAULT 1)"
     )
     columns = [row[1] for row in conn.execute("PRAGMA table_info(urls)")]
     if "custom_alias" not in columns:
         conn.execute("ALTER TABLE urls ADD COLUMN custom_alias TEXT UNIQUE")
     if "expires_at" not in columns:
         conn.execute("ALTER TABLE urls ADD COLUMN expires_at TEXT")
+    if "is_active" not in columns:
+        conn.execute(
+            "ALTER TABLE urls ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"
+        )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS click_events ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -210,23 +229,57 @@ def _lookup_id(code: str) -> int:
 
 
 def _resolve(conn, code: str):
-    """Return (id, long_url, clicks, expires_at) for an alias or a generated code."""
+    """Return (id, long_url, clicks, expires_at, is_active) for a code.
+
+    Raises 404 for an unknown code, 410 for an expired or deactivated
+    link. The 410 covers redirect, stats and per-day stats alike, since
+    they all resolve through here.
+    """
     row = conn.execute(
-        "SELECT id, long_url, clicks, expires_at FROM urls WHERE custom_alias = ?",
+        "SELECT id, long_url, clicks, expires_at, is_active FROM urls "
+        "WHERE custom_alias = ?",
         (code,),
     ).fetchone()
     if row is None:
         row_id = _lookup_id(code)
         row = conn.execute(
-            "SELECT id, long_url, clicks, expires_at FROM urls WHERE id = ?",
+            "SELECT id, long_url, clicks, expires_at, is_active FROM urls "
+            "WHERE id = ?",
             (row_id,),
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Unknown short code")
+    if row[4] == 0:
+        raise HTTPException(status_code=410, detail="Link deactivated")
     if row[3] is not None:
         expires_at = datetime.fromisoformat(row[3])
         if expires_at <= datetime.now(timezone.utc):
             raise HTTPException(status_code=410, detail="Link expired")
+    return row
+
+
+def _lookup_row(conn, code: str):
+    """Return (id, long_url, clicks, custom_alias, expires_at, is_active).
+
+    Unlike _resolve, this finds the row regardless of expiry or active
+    state, so the delete endpoint can act on any existing link. Returns
+    None for an unknown code.
+    """
+    row = conn.execute(
+        "SELECT id, long_url, clicks, custom_alias, expires_at, is_active "
+        "FROM urls WHERE custom_alias = ?",
+        (code,),
+    ).fetchone()
+    if row is None:
+        try:
+            row_id = _decode(code)
+        except ValueError:
+            return None
+        row = conn.execute(
+            "SELECT id, long_url, clicks, custom_alias, expires_at, "
+            "is_active FROM urls WHERE id = ?",
+            (row_id,),
+        ).fetchone()
     return row
 
 
@@ -282,15 +335,20 @@ def shorten(req: ShortenRequest, request: Request):
             "expires_at": expires_at,
         }
     existing = conn.execute(
-        "SELECT id, custom_alias, expires_at FROM urls "
+        "SELECT id, custom_alias, expires_at, is_active FROM urls "
         "WHERE long_url = ? ORDER BY id LIMIT 1",
         (str(req.url),),
     ).fetchone()
     if existing is not None:
         stored_expires_at = existing[2]
-        live = stored_expires_at is None or datetime.fromisoformat(
-            stored_expires_at
-        ) > datetime.now(timezone.utc)
+        live = (
+            existing[3] == 1
+            and (
+                stored_expires_at is None
+                or datetime.fromisoformat(stored_expires_at)
+                > datetime.now(timezone.utc)
+            )
+        )
         if live:
             code = (
                 existing[1] if existing[1] is not None else _encode(existing[0])
@@ -338,6 +396,35 @@ def redirect(code: str, request: Request):
     return RedirectResponse(url=row[1])
 
 
+@app.delete("/api/links/{code}")
+def deactivate_link(code: str):
+    """Deactivate a link (soft delete).
+
+    The row stays in the database, so its click history survives, but
+    the link stops redirecting and its stats return 410, like an expired
+    link. Deleting is idempotent: deactivating an already deactivated
+    link returns 200 again. An unknown code returns 404. The custom
+    alias stays reserved, so it still returns 409 if reused, and the
+    cached redirect entries are evicted so the link stops working at
+    once. Shortening the same URL again creates a fresh link.
+    """
+    conn = _db()
+    row = _lookup_row(conn, code)
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Unknown short code")
+    conn.execute("UPDATE urls SET is_active = 0 WHERE id = ?", (row[0],))
+    conn.commit()
+    _cache_invalidate(row[0], row[3])
+    conn.close()
+    return {
+        "short_code": code,
+        "long_url": row[1],
+        "clicks": row[2],
+        "active": False,
+    }
+
+
 # Top links: how many links to return when the caller does not pass a
 # limit, and the most a caller may ask for in one request. A 100 cap keeps
 # one request from forcing a huge response.
@@ -353,8 +440,9 @@ def top_links(
 
     The ranking reads the urls.clicks counter, which is incremented on
     every redirect, so it always agrees with /api/stats. Ties are broken
-    by the oldest link first, so the order is stable. Expired links are
-    left out, since they no longer redirect and return 410 elsewhere.
+    by the oldest link first, so the order is stable. Expired and
+    deactivated links are left out, since they no longer redirect and
+    return 410 elsewhere.
     The short_code is the custom alias when one was set, else the
     generated base62 code. A limit outside 1 to 100 returns 422.
     """
@@ -362,7 +450,7 @@ def top_links(
     now = datetime.now(timezone.utc).isoformat()
     rows = conn.execute(
         "SELECT id, long_url, clicks, custom_alias FROM urls "
-        "WHERE expires_at IS NULL OR expires_at > ? "
+        "WHERE is_active = 1 AND (expires_at IS NULL OR expires_at > ?) "
         "ORDER BY clicks DESC, id ASC LIMIT ?",
         (now, limit),
     ).fetchall()

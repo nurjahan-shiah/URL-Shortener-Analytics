@@ -874,3 +874,198 @@ def test_top_links_shows_alias_and_generated_code():
 
 
 
+def test_deactivate_link_stops_redirect_and_stats():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/deactivate",
+            "custom_alias": "deactivate",
+        },
+    )
+    assert r.status_code == 200
+
+    r = client.get("/deactivate", follow_redirects=False)
+    assert r.status_code in (307, 308)
+
+    r = client.delete("/api/links/deactivate")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["short_code"] == "deactivate"
+    assert body["long_url"] == "https://example.com/deactivate"
+    assert body["clicks"] == 1
+    assert body["active"] is False
+
+    assert client.get("/deactivate", follow_redirects=False).status_code == 410
+    assert client.get("/api/stats/deactivate").status_code == 410
+    assert client.get("/api/stats/deactivate/per-day").status_code == 410
+
+
+def test_deactivate_unknown_code_404():
+    assert client.delete("/api/links/doesnotexist123").status_code == 404
+
+
+def test_deactivate_is_idempotent():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/deactivate-twice",
+            "custom_alias": "deactivate-twice",
+        },
+    )
+    assert r.status_code == 200
+
+    first = client.delete("/api/links/deactivate-twice")
+    assert first.status_code == 200
+    assert first.json()["active"] is False
+
+    second = client.delete("/api/links/deactivate-twice")
+    assert second.status_code == 200
+    assert second.json()["active"] is False
+
+
+def test_deactivated_link_excluded_from_top_links():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/deactivate-top",
+            "custom_alias": "deactivate-top",
+        },
+    )
+    assert r.status_code == 200
+    for _ in range(5):
+        client.get("/deactivate-top", follow_redirects=False)
+
+    r = client.delete("/api/links/deactivate-top")
+    assert r.status_code == 200
+
+    r = client.get("/api/stats/top", params={"limit": 100})
+    assert r.status_code == 200
+    assert all(
+        link["short_code"] != "deactivate-top" for link in r.json()["links"]
+    )
+
+
+def test_deactivated_link_clicks_not_counted():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/deactivate-no-count",
+            "custom_alias": "deactivate-no-count",
+        },
+    )
+    assert r.status_code == 200
+
+    client.get("/deactivate-no-count", follow_redirects=False)
+    assert client.delete("/api/links/deactivate-no-count").status_code == 200
+
+    r = client.get("/deactivate-no-count", follow_redirects=False)
+    assert r.status_code == 410
+
+    conn = sqlite3.connect(DB_PATH)
+    clicks = conn.execute(
+        "SELECT clicks FROM urls WHERE custom_alias = ?",
+        ("deactivate-no-count",),
+    ).fetchone()[0]
+    conn.close()
+    assert clicks == 1
+
+
+def test_duplicate_url_after_deactivate_creates_new_link():
+    first = client.post(
+        "/api/shorten", json={"url": "https://example.com/deactivate-dup"}
+    )
+    assert first.status_code == 200
+    old_code = first.json()["short_code"]
+
+    assert client.delete(f"/api/links/{old_code}").status_code == 200
+
+    second = client.post(
+        "/api/shorten", json={"url": "https://example.com/deactivate-dup"}
+    )
+    assert second.status_code == 200
+    assert second.json()["short_code"] != old_code
+
+    r = client.get(f"/{second.json()['short_code']}", follow_redirects=False)
+    assert r.status_code in (307, 308)
+
+
+def test_deactivated_alias_still_reserved():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/deactivate-alias",
+            "custom_alias": "deactivate-alias",
+        },
+    )
+    assert r.status_code == 200
+
+    assert client.delete("/api/links/deactivate-alias").status_code == 200
+
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/other-url",
+            "custom_alias": "deactivate-alias",
+        },
+    )
+    assert r.status_code == 409
+
+
+def test_deactivate_evicts_cached_redirect():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/deactivate-cached",
+            "custom_alias": "deactivate-cached",
+        },
+    )
+    assert r.status_code == 200
+
+    r = client.get("/deactivate-cached", follow_redirects=False)
+    assert r.status_code in (307, 308)
+    assert "deactivate-cached" in redirect_cache
+
+    assert client.delete("/api/links/deactivate-cached").status_code == 200
+    assert "deactivate-cached" not in redirect_cache
+
+    r = client.get("/deactivate-cached", follow_redirects=False)
+    assert r.status_code == 410
+
+
+def test_deactivate_generated_code():
+    r = client.post(
+        "/api/shorten", json={"url": "https://example.com/deactivate-generated"}
+    )
+    assert r.status_code == 200
+    code = r.json()["short_code"]
+
+    r = client.delete(f"/api/links/{code}")
+    assert r.status_code == 200
+    assert r.json()["short_code"] == code
+    assert r.json()["active"] is False
+
+    assert client.get(f"/{code}", follow_redirects=False).status_code == 410
+
+
+def test_deactivate_expired_link_still_works():
+    r = client.post(
+        "/api/shorten",
+        json={
+            "url": "https://example.com/deactivate-expired",
+            "custom_alias": "deactivate-expired",
+        },
+    )
+    assert r.status_code == 200
+
+    past = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE urls SET expires_at = ? WHERE custom_alias = ?",
+        (past, "deactivate-expired"),
+    )
+    conn.commit()
+    conn.close()
+
+    r = client.delete("/api/links/deactivate-expired")
+    assert r.status_code == 200
+    assert r.json()["active"] is False
